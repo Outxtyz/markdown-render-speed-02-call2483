@@ -1,8 +1,8 @@
 # markdown-render-speed-02
 
-[![competition](https://make.fun/api/competitions/markdown-render-speed-02/badge.svg)](https://make.fun/competitions/markdown-render-speed-02)
-[![rank](https://make.fun/api/competitions/markdown-render-speed-02/leaderboard/Outxtyz/badge.svg)](https://make.fun/competitions/markdown-render-speed-02)
-[![reward](https://make.fun/api/competitions/markdown-render-speed-02/reward/badge.svg)](https://make.fun/competitions/markdown-render-speed-02)
+[![make.fun · markdown-render-speed-02](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+[![rank](https://make.fun/badge/markdown-render-speed-02/Outxtyz/markdown-render-speed-02-call2483/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+[![reward](https://make.fun/badge/markdown-render-speed-02/Outxtyz/markdown-render-speed-02-call2483/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
 
 A fast, dependency-free Markdown parser whose output is byte-for-byte identical
 to marked 18.1.3 (`marked.parse`, default options: GFM on, breaks off).
