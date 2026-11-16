@@ -1363,7 +1363,6 @@ function tryDel(src, i, n) {
   return null;
 }
 // `linkState` (when given) is a shared {inLink} object: parseInline reads
-// its inLink at the start and writes the final value back, so an unclosed
 // <a> leaks inLink into later paragraphs (marked's behaviour). Recursive
 // calls for link labels get a fresh {inLink:true} that does not leak back.
 function parseInline(src, links, linkState) {
