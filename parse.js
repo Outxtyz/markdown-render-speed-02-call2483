@@ -1213,14 +1213,22 @@ function tryEmStrong(src, i, links) {
       }
     }
   }
-  while (p < n) {
-    const c = src[p];
-    if (c === '\\') { p += 2; continue; }
-    if (c === '`') {
-      let q = p;
-      while (q < n && src[q] === '`') q++;
-      const run = q - p;
-      let m2 = q, found = -1;
+  // Scan for the closer with a regex jump: the engine (C) skips plain text
+  // and only stops at escapes, backtick runs, '[', '<', or a * / _ run.
+  // A fresh RegExp object per call (pattern is cached by V8) so nested
+  // tryEmStrong calls (via recursive content lexing) cannot clobber
+  // each other's lastIndex.
+  const SCAN_RE = new RegExp('\\\\.|`+|\\[|<|\\*+|_+', 'g');
+  SCAN_RE.lastIndex = p;
+  let match;
+  while ((match = SCAN_RE.exec(src)) !== null) {
+    const tok = match[0];
+    const tp = match.index;
+    const tc = tok[0];
+    if (tc === '\\') continue;
+    if (tc === '`') {
+      const run = tok.length;
+      let m2 = tp + run, found = -1;
       while (m2 < n) {
         if (src[m2] === '`') {
           let e = m2;
@@ -1229,25 +1237,24 @@ function tryEmStrong(src, i, links) {
           m2 = e;
         } else m2++;
       }
-      p = found >= 0 ? found + run : q;
+      SCAN_RE.lastIndex = found >= 0 ? found + run : tp + run;
       continue;
     }
-    if (c === '<') {
+    if (tc === '<') {
       // a delimiter inside an HTML tag attribute cannot close an emphasis
       // (marked masks tags in the source it scans for closers)
-      const tag = matchTagAt(src, p);
-      if (tag) { p += tag.length; continue; }
-      const al = matchAutolinkAt(src, p);
-      if (al) { p += al.length; continue; }
-      p++;
+      const tag = matchTagAt(src, tp);
+      if (tag) { SCAN_RE.lastIndex = tp + tag.length; continue; }
+      const al = matchAutolinkAt(src, tp);
+      if (al) { SCAN_RE.lastIndex = tp + al.length; continue; }
       continue;
     }
-    if (c === '[' || (c === '!' && src[p + 1] === '[')) {
+    if (tc === '[') {
       // a delimiter inside a link/image label cannot close an emphasis
       // that started outside the label -- but only when the [...] actually
       // forms a link (marked masks reflink-like patterns only when the
       // reference resolves; an unresolvable [...] leaves its * visible)
-      const lb = c === '[' ? p : p + 1;
+      const lb = tp;
       const le = findLabelEnd(src, lb);
       if (le > 0) {
         const labelText = src.slice(lb + 1, le - 1);
@@ -1265,16 +1272,14 @@ function tryEmStrong(src, i, links) {
           const ref = normLabel(labelText);
           if (links && links[ref]) { isLink = true; endPos = le; }
         }
-        if (isLink) { p = endPos; continue; }
+        if (isLink) { SCAN_RE.lastIndex = endPos; continue; }
       }
-      p++;
       continue;
     }
-    if (c !== r) { p++; continue; }
-    let q = p;
-    while (q < n && src[q] === c) q++;
-    const len = q - p;
-    const bprev = p === 0 ? '' : src[p - 1];
+    if (tc !== r) continue;
+    const q = tp + tok.length;
+    const len = tok.length;
+    const bprev = tp === 0 ? '' : src[tp - 1];
     const bnext = q < n ? src[q] : '';
     const bprevWs = bprev === '' || isWsCh(bprev);
     const bnextWs = bnext === '' || isWsCh(bnext);
@@ -1283,19 +1288,19 @@ function tryEmStrong(src, i, links) {
     const bLeft = !bnextWs && (!bnextPunct || bprevWs || bprevPunct);
     const bRight = bprev !== '' && !bprevWs && (!bprevPunct || bnextWs || bnextPunct);
     let canOpen, canClose;
-    if (c === '*') { canOpen = bLeft; canClose = bRight; }
+    if (tc === '*') { canOpen = bLeft; canClose = bRight; }
     else { canOpen = bLeft && (!bRight || bprevPunct); canClose = bRight && (!bLeft || bnextPunct); }
-    if (!canOpen && !canClose) { p = q; continue; }
-    if (canOpen && !canClose) { m += len; p = q; continue; }
+    if (!canOpen && !canClose) continue;
+    if (canOpen && !canClose) { m += len; continue; }
     // closer (canClose); if it can also open, or the opener can also close,
     // the rule-of-3 odd-match check applies first
     if ((canOpen && canClose) || R) {
-      if (y % 3 !== 0 && (y + len) % 3 === 0) { f += len; p = q; continue; }
+      if (y % 3 !== 0 && (y + len) % 3 === 0) { f += len; continue; }
     }
     m -= len;
-    if (m > 0) { p = q; continue; }
+    if (m > 0) continue;
     closerLen = Math.min(len, len + m + f);
-    closerStart = p;
+    closerStart = tp;
     break;
   }
   if (closerStart < 0) return null;
