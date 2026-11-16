@@ -121,6 +121,32 @@ function trimTrailingBlanks(s) {
   return lines.slice(0, t + 1).join('\n');
 }
 
+// First line of `s` without splitting the whole string: splitting a long
+// remaining source per line is quadratic in the document size.
+function firstLine(s) {
+  const nl = s.indexOf('\n');
+  return nl < 0 ? s : s.slice(0, nl);
+}
+
+// Continuation-line tests for list items, cached per indent R: the patterns
+// depend only on R, and building six RegExps per item is pure overhead.
+const LIST_CONT_RES = new Map();
+function listContRes(R) {
+  let r = LIST_CONT_RES.get(R);
+  if (r) return r;
+  const d = Math.max(0, Math.min(3, R - 1));
+  r = {
+    vRe: new RegExp(`^ {0,${d}}(?:[*+-]|\\d{1,9}[.)])((?:[ \\t][^\\n]*)?(?:\\n|$))`),
+    qRe: new RegExp(`^ {0,${d}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)`),
+    eeRe: new RegExp(`^ {0,${d}}(?:\`\`\`|~~~)`),
+    teRe: new RegExp(`^ {0,${d}}#{1,6}(?:\\s|$)`),
+    mRe: new RegExp(`^ {0,${d}}(?:<\\/?(?:${BLOCK_TAGS})(?: +|$|\\/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i'),
+    neRe: new RegExp(`^ {0,${d}}>`),
+  };
+  LIST_CONT_RES.set(R, r);
+  return r;
+}
+
 class Lexer {
   constructor() {
     this.tokens = [];
@@ -316,14 +342,17 @@ class Lexer {
   // The paragraph part stops at blank lines and at lines that start a list,
   // fence, blockquote, heading, thematic break, html block or table.
   tokSetext(src) {
-    const lines = src.split('\n');
-    if (lines.length < 2) return null;
-    const first = lines[0];
+    let nl = src.indexOf('\n');
+    if (nl < 0) return null;
+    const first = src.slice(0, nl);
     if (/^[ \t]*$/.test(first)) return null;
     const acc = [first];
-    let i = 1, rawLen = first.length + 1;
-    for (; i < lines.length; i++) {
-      const line = lines[i];
+    let rawLen = first.length + 1;
+    let pos = nl + 1;
+    while (pos < src.length) {
+      const e2 = src.indexOf('\n', pos);
+      const last = e2 < 0;
+      const line = last ? src.slice(pos) : src.slice(pos, e2);
       if (/^[ \t]*$/.test(line)) return null;
       const sm = /^ {0,3}(=+|-+)[ \t]*$/.exec(line);
       if (sm) {
@@ -331,9 +360,16 @@ class Lexer {
         const raw = src.slice(0, rawLen + line.length);
         return { type: 'heading', raw: stripEnd(raw, 10), depth: sm[1][0] === '=' ? 1 : 2, text, tokens: this.inline(text) };
       }
-      if (this.lineStartsBlock(line, lines[i + 1], true)) return null;
+      let nextLine;
+      if (last) nextLine = undefined;
+      else {
+        const e3 = src.indexOf('\n', e2 + 1);
+        nextLine = e3 < 0 ? src.slice(e2 + 1) : src.slice(e2 + 1, e3);
+      }
+      if (this.lineStartsBlock(line, nextLine, true)) return null;
       acc.push(line);
       rawLen += line.length + 1;
+      pos = last ? src.length : e2 + 1;
     }
     return null;
   }
@@ -352,23 +388,33 @@ class Lexer {
   }
 
   // A paragraph: lines of text, each continuing while it is non-blank and
-  // does not start an interrupting block.
+  // does not start an interrupting block. Lines are walked positionally
+  // (indexOf) instead of splitting the whole remaining source: splitting
+  // here runs on every block position and is quadratic in the document.
   tokParagraph(src) {
-    const lines = src.split('\n');
-    const first = lines[0];
+    let nl = src.indexOf('\n');
+    const first = nl < 0 ? src : src.slice(0, nl);
     if (/^[ \t]*$/.test(first)) return null;
     const acc = [first];
-    let rawLen = first.length;
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i];
+    let pos = nl < 0 ? src.length : nl + 1;
+    while (pos < src.length) {
+      const e2 = src.indexOf('\n', pos);
+      const last = e2 < 0;
+      const line = last ? src.slice(pos) : src.slice(pos, e2);
       // a whitespace-only line ends the paragraph, except when it is a real
       // last line (marked's paragraph regex only treats `[ \t]+\n` as a
       // break, so a trailing whitespace-only line with no newline joins);
       // the empty tail produced by a final newline is not a real line
-      if (/^[ \t]*$/.test(line) && (i < lines.length - 1 || line === '')) break;
-      if (this.lineStartsBlock(line, lines[i + 1], false)) break;
+      if (/^[ \t]*$/.test(line) && (!last || line === '')) break;
+      let nextLine;
+      if (last) nextLine = undefined;
+      else {
+        const e3 = src.indexOf('\n', e2 + 1);
+        nextLine = e3 < 0 ? src.slice(e2 + 1) : src.slice(e2 + 1, e3);
+      }
+      if (this.lineStartsBlock(line, nextLine, false)) break;
       acc.push(line);
-      rawLen += 1 + line.length;
+      pos = last ? src.length : e2 + 1;
     }
     const text = acc.join('\n');
     return { type: 'paragraph', raw: text, text, tokens: this.inline(text) };
@@ -405,15 +451,20 @@ class Lexer {
   }
 
   tokTable(src) {
-    const lines = src.split('\n');
-    if (lines.length < 2) return null;
-    const parts = this.tableParts(lines[0], lines[1]);
+    let nl = src.indexOf('\n');
+    if (nl < 0) return null;
+    const first = src.slice(0, nl);
+    const e2 = src.indexOf('\n', nl + 1);
+    const second = e2 < 0 ? src.slice(nl + 1) : src.slice(nl + 1, e2);
+    const parts = this.tableParts(first, second);
     if (!parts) return null;
     const rows = [];
-    let rawLen = lines[0].length + 1 + lines[1].length;
-    let i = 2;
-    for (; i < lines.length; i++) {
-      const line = lines[i];
+    let rawLen = first.length + 1 + second.length;
+    let pos = e2 < 0 ? src.length : e2 + 1;
+    while (pos < src.length) {
+      const e3 = src.indexOf('\n', pos);
+      const last = e3 < 0;
+      const line = last ? src.slice(pos) : src.slice(pos, e3);
       // a row ends at a spaces-only line; a tab-only line is NOT blank here
       // (marked's table row regex only excludes ` *\n`), it becomes an
       // empty row
@@ -427,6 +478,7 @@ class Lexer {
       if (this.isHtmlStart(line)) break;
       rows.push(splitRow(line, parts.header.length));
       rawLen += 1 + line.length;
+      pos = last ? src.length : e3 + 1;
     }
     const raw = src.slice(0, rawLen);
     const cell = (s) => ({ text: s, tokens: this.inline(s) });
@@ -434,10 +486,10 @@ class Lexer {
   }
 
   // An html block (types 1-7). Types 1-5 run to their closing marker, types
-  // 6-7 run to the first blank line.
+  // 6-7 run to the first blank line. The lines are walked positionally: the
+  // old version split the whole remaining source on every call.
   tokHtml(src) {
-    const lines = src.split('\n');
-    const first = lines[0];
+    const first = firstLine(src);
     const start = /^ {0,3}/.exec(first)[0].length;
     const rest = first.slice(start);
     let kind = 0, closer = null, closeTag = null;
@@ -456,22 +508,20 @@ class Lexer {
     if (kind === 7) {
       // handled by the regexes above
     }
-    let endLine = -1;
-    if (kind === 1) {
-      const re = new RegExp(`</${closeTag}(?:[\\s>]|$)`, 'i');
-      for (let i = 0; i < lines.length; i++) if (re.test(lines[i])) { endLine = i; break; }
-    } else if (kind === 2) {
-      for (let i = 0; i < lines.length; i++) if (lines[i].indexOf('-->') >= 0) { endLine = i; break; }
-    } else if (kind === 3) {
-      for (let i = 0; i < lines.length; i++) if (lines[i].indexOf('?>') >= 0) { endLine = i; break; }
-    } else if (kind === 4) {
-      for (let i = 0; i < lines.length; i++) if (lines[i].indexOf('>') >= 0) { endLine = i; break; }
-    } else if (kind === 5) {
-      for (let i = 0; i < lines.length; i++) if (lines[i].indexOf(']]>') >= 0) { endLine = i; break; }
-    }
     let text;
     if (kind <= 5) {
-      if (endLine < 0) {
+      // find the terminator in the whole source; the block runs to the end
+      // of the line that holds it
+      let termIdx = -1;
+      if (kind === 1) {
+        const re = new RegExp(`</${closeTag}(?:[\\s>]|$)`, 'i');
+        const mm = re.exec(src);
+        if (mm) termIdx = mm.index;
+      } else if (kind === 2) termIdx = src.indexOf('-->');
+      else if (kind === 3) termIdx = src.indexOf('?>');
+      else if (kind === 4) termIdx = src.indexOf('>');
+      else if (kind === 5) termIdx = src.indexOf(']]>');
+      if (termIdx < 0) {
         text = src;
       } else {
         // up to the terminator line and its newline, plus any additional
@@ -479,8 +529,8 @@ class Lexer {
         // html regex ends with (\n+|$), so a whitespace-only line (tab or
         // spaces) stops the match, while an empty line is included and
         // then trimmed by ge() to no trailing newline
-        let upto = 0;
-        for (let i = 0; i <= endLine; i++) upto += lines[i].length + 1;
+        let upto = src.indexOf('\n', termIdx);
+        upto = upto < 0 ? src.length : upto + 1;
         while (upto < src.length && src[upto] === '\n') upto++;
         text = trimTrailingBlanks(src.slice(0, upto));
       }
@@ -491,14 +541,19 @@ class Lexer {
     // trailing newline when a blank line follows (marked's html regex stops
     // before it)
     const body = [];
-    for (let i = 0; i < lines.length; i++) {
+    let pos = 0, consumedAll = true;
+    while (pos < src.length) {
+      const e2 = src.indexOf('\n', pos);
+      const last = e2 < 0;
+      const line = last ? src.slice(pos) : src.slice(pos, e2);
       // a blank line ends the block, but the empty tail produced by a final
       // newline is not a blank line (there is no content after it)
-      if (/^[ \t]*$/.test(lines[i]) && i < lines.length - 1) break;
-      body.push(lines[i]);
+      if (/^[ \t]*$/.test(line) && !last) { consumedAll = false; break; }
+      body.push(line);
+      pos = last ? src.length : e2 + 1;
     }
     text = body.join('\n');
-    if (body.length === lines.length && src.endsWith('\n') && !text.endsWith('\n')) text += '\n';
+    if (consumedAll && src.endsWith('\n') && !text.endsWith('\n')) text += '\n';
     return { type: 'html', raw: text, text, pre: false };
   }
 
@@ -615,28 +670,35 @@ class Lexer {
   }
 
   // A blockquote: a run of lines starting with >, plus lazy paragraph lines.
+  // The extent is found by walking lines positionally; only the consumed
+  // quote is split into lines (splitting the whole remaining source here
+  // runs on every blockquote position and is quadratic in the document).
   tokBlockquote(src) {
-    const lines = src.split('\n');
-    if (!/^ {0,3}>/.test(lines[0])) return null;
+    if (!/^ {0,3}>/.test(firstLine(src))) return null;
     // how many lines the quote consumes (the regex's reach)
-    let i = 0, paraOpen = false;
-    const n = lines.length;
-    while (i < n) {
-      const line = lines[i];
+    let i = 0, paraOpen = false, pos = 0, endPos = 0;
+    while (pos < src.length) {
+      const e2 = src.indexOf('\n', pos);
+      const last = e2 < 0;
+      const line = last ? src.slice(pos) : src.slice(pos, e2);
       if (/^ {0,3}>/.test(line)) {
         const content = line.replace(/^ {0,3}>[ \t]?/, '');
         paraOpen = !/^[ \t]*$/.test(content);
         i++;
+        pos = last ? src.length : e2 + 1;
+        endPos = pos;
       } else {
         if (!paraOpen) break;
         if (/^[ \t]*$/.test(line)) break;
         if (this.isKeInterrupt(line)) break;
         i++;
+        pos = last ? src.length : e2 + 1;
+        endPos = pos;
       }
     }
     if (i === 0) return null;
     // drop a trailing empty line produced by the final newline
-    let consumed = lines.slice(0, i);
+    let consumed = src.slice(0, endPos).split('\n');
     if (consumed.length > 0 && consumed[consumed.length - 1] === '' && src.endsWith('\n')) consumed = consumed.slice(0, -1);
     let rest = consumed.slice();
     const rawParts = [], textParts = [];
@@ -735,7 +797,7 @@ class Lexer {
       const g = t[2].split('\n')[0];
       const b = t[1].length;
       let m = g.replace(/^[ \t]+/, v => expandTabs(v, b));
-      let f = e.split('\n')[0];
+      let f = firstLine(e);
       const y0 = !m.trim();
       let R = 0;
       if (y0) R = b + 1;
@@ -748,14 +810,11 @@ class Lexer {
       let y = y0;
       if (y && /^[ \t]*$/.test(f)) { e = e.slice(f.length + 1); u = true; }
       if (!u) {
-        const vRe = new RegExp(`^ {0,${D(R)}}(?:[*+-]|\\d{1,9}[.)])((?:[ \\t][^\\n]*)?(?:\\n|$))`);
-        const qRe = new RegExp(`^ {0,${D(R)}}((?:-[ \\t]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)`);
-        const eeRe = new RegExp(`^ {0,${D(R)}}(?:\`\`\`|~~~)`);
-        const teRe = new RegExp(`^ {0,${D(R)}}#{1,6}(?:\\s|$)`);
-        const mRe = new RegExp(`^ {0,${D(R)}}(?:<\\/?(?:${BLOCK_TAGS})(?: +|$|\\/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i');
-        const neRe = new RegExp(`^ {0,${D(R)}}>`);
+        // the continuation-line tests depend only on the item's indent R,
+        // so build them once per R instead of once per item
+        const { vRe, qRe, eeRe, teRe, mRe, neRe } = listContRes(R);
         while (e) {
-          const U = e.split('\n')[0];
+          const U = firstLine(e);
           f = U;
           const Z = f.replace(/^[ \t]+/, me => expandTabs(me, 0));
           if (eeRe.test(f) || teRe.test(f) || mRe.test(f) || neRe.test(f) || vRe.test(f) || qRe.test(f)) break;
@@ -887,6 +946,13 @@ const TAG_PI_RE = /^<\?(?:(?!\?>)[\s\S])*?\?>/;
 const TAG_DECL_RE = /^<![A-Za-z](?:(?!>)[\s\S])*?>/;
 const TAG_CDATA_RE = /^<!\[CDATA\[(?:(?!\]\]>)[\s\S])*?\]\]>/;
 const RAW_TAGS = { pre: 1, code: 1, kbd: 1, script: 1 };
+// tag shapes that flip the inLink / inRaw flags (see the `<` branch):
+// `<a ` needs the space, `</a>` needs the `>` right after the name,
+// raw openers need a space or `>` after the name.
+const START_A_RE = /^<a /i;
+const END_A_RE = /^<\/a>/i;
+const START_RAW_RE = /^<(pre|code|kbd|script)(\s|>)/i;
+const END_RAW_RE = /^<\/(pre|code|kbd|script)(\s|>)/i;
 const LINK_START_RE = /^!?\[/;
 const TEXT_STOP_RE = /[\\`*!\[<>\n~_]|www\.|:\/\/|@|mailto:|xmpp:/g;
 
@@ -918,6 +984,11 @@ function findLabelEnd(src, i) {
     if (c === '`') {
       let k = j;
       while (k < n && src[k] === '`') k++;
+      // a run of 2+ backticks immediately before ']' is literal backticks
+      // (marked's ``+(?=]) label alternative), not a code-span opener: the
+      // ] closes the label here. Without this the scan jumps to some later
+      // backtick in the paragraph and the label (and its link) is lost.
+      if (k - j >= 2 && src[k] === ']') { j = k; continue; }
       // marked's label code-span alternative is `+[^`]*?`+ : the closing run
       // is the FIRST backtick run after the opening run (any length, the
       // content between them has no backtick by construction)
@@ -1167,9 +1238,47 @@ function renderInline(nodes) {
 // The content is lexed recursively by the caller (so an email at the end of
 // the content does not see the closing delimiter, exactly as in marked).
 const ALNUM_RE = /[\p{L}\p{N}]/u;
-function tryEmStrong(src, i, links) {
+// ---------------------------------------------------------------------------
+// masked source for emphasis / strikethrough closer searches
+// ---------------------------------------------------------------------------
+// When marked looks for an emphasis (or del) closer it does not scan the raw
+// paragraph text: it scans a masked copy in which code spans and
+// [...](...) links are blanked out to same-length `[aaa...]`, backslash-
+// escaped punctuation becomes `+`, and backticks inside a code span become
+// `+`. A delimiter inside a code span or a link therefore cannot close an
+// emphasis that started outside it -- even when the code span or link starts
+// before the opener (for example an unbalanced `` `` `` in a link label can
+// pair with a backtick after the emphasis and swallow the closer). The mask
+// preserves every position, so a closer found in the masked text maps back
+// onto the same span of the raw text. Only the closer search uses the mask;
+// the opener, the tokenisers, and the returned raw text all use the raw text.
+const MASK_CODE_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const MASK_SKIP_RE = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+function buildMask(src) {
+  // code spans: keep the delimiters, turn inner backticks into `+`;
+  // a backslash-escaped punctuation char becomes `+`s (so `\*` is no
+  // delimiter); a lone backtick run is left alone. Either replace can only
+  // match when the text holds a backtick, a backslash, `[`, or `<`, so
+  // skip the scan when none of those are present.
+  let t = src;
+  if (src.indexOf('`') >= 0 || src.indexOf('\\') >= 0) {
+    t = t.replace(MASK_CODE_RE, (n, s, r) => r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  }
+  // links and code spans (and tags): the whole span becomes `[aaa...]`,
+  // which hides any delimiter inside it from the closer search.
+  if (src.indexOf('[') >= 0 || src.indexOf('`') >= 0 || src.indexOf('<') >= 0) {
+    t = t.replace(MASK_SKIP_RE, (n) => '[' + 'a'.repeat(n.length - 2) + ']');
+  }
+  return t;
+}
+
+// `scan` is the masked source for the closer search (same length as `src`);
+// when it is not given the raw text is scanned. The opener checks and the
+// returned text/rawLen always use the raw `src`.
+function tryEmStrong(src, i, links, scan) {
   const n = src.length;
   const r = src[i];
+  scan = scan || src;
   // walk back over preceding same chars: the opener checks use the char
   // before the whole run (marked's l/n), and y is the whole run length
   let l = i;
@@ -1202,14 +1311,14 @@ function tryEmStrong(src, i, links) {
   {
     const other = r === '*' ? '_' : '*';
     let q = j;
-    while (q < n && src[q] !== '*' && src[q] !== '_') q++;
-    if (q + 1 < n && src[q] === other && src[q + 1] === other && src[q + 2] !== other) {
+    while (q < n && scan[q] !== '*' && scan[q] !== '_') q++;
+    if (q + 1 < n && scan[q] === other && scan[q + 1] === other && scan[q + 2] !== other) {
       q += 2;
-      while (q < n && src[q] !== '*' && src[q] !== '_') q++;
-      if (q < n && src[q] === r && src[q + 1] !== r) {
+      while (q < n && scan[q] !== '*' && scan[q] !== '_') q++;
+      if (q < n && scan[q] === r && scan[q + 1] !== r) {
         q++;
-        while (q < n && src[q] !== '*' && src[q] !== '_') q++;
-        if (q + 1 < n && src[q] === other && src[q + 1] === other && src[q + 2] !== other) p = q;
+        while (q < n && scan[q] !== '*' && scan[q] !== '_') q++;
+        if (q + 1 < n && scan[q] === other && scan[q + 1] === other && scan[q + 2] !== other) p = q;
       }
     }
   }
@@ -1221,7 +1330,7 @@ function tryEmStrong(src, i, links) {
   const SCAN_RE = new RegExp('\\\\.|`+|\\[|<|\\*+|_+', 'g');
   SCAN_RE.lastIndex = p;
   let match;
-  while ((match = SCAN_RE.exec(src)) !== null) {
+  while ((match = SCAN_RE.exec(scan)) !== null) {
     const tok = match[0];
     const tp = match.index;
     const tc = tok[0];
@@ -1230,9 +1339,9 @@ function tryEmStrong(src, i, links) {
       const run = tok.length;
       let m2 = tp + run, found = -1;
       while (m2 < n) {
-        if (src[m2] === '`') {
+        if (scan[m2] === '`') {
           let e = m2;
-          while (e < n && src[e] === '`') e++;
+          while (e < n && scan[e] === '`') e++;
           if (e - m2 === run) { found = m2; break; }
           m2 = e;
         } else m2++;
@@ -1242,10 +1351,10 @@ function tryEmStrong(src, i, links) {
     }
     if (tc === '<') {
       // a delimiter inside an HTML tag attribute cannot close an emphasis
-      // (marked masks tags in the source it scans for closers)
-      const tag = matchTagAt(src, tp);
+      // (the mask already hides most tags; this covers what it leaves)
+      const tag = matchTagAt(scan, tp);
       if (tag) { SCAN_RE.lastIndex = tp + tag.length; continue; }
-      const al = matchAutolinkAt(src, tp);
+      const al = matchAutolinkAt(scan, tp);
       if (al) { SCAN_RE.lastIndex = tp + al.length; continue; }
       continue;
     }
@@ -1255,17 +1364,17 @@ function tryEmStrong(src, i, links) {
       // forms a link (marked masks reflink-like patterns only when the
       // reference resolves; an unresolvable [...] leaves its * visible)
       const lb = tp;
-      const le = findLabelEnd(src, lb);
+      const le = findLabelEnd(scan, lb);
       if (le > 0) {
-        const labelText = src.slice(lb + 1, le - 1);
+        const labelText = scan.slice(lb + 1, le - 1);
         let isLink = false, endPos = le;
-        if (src[le] === '(') {
-          const dest = parseLinkDest(src, le);
+        if (scan[le] === '(') {
+          const dest = parseLinkDest(scan, le);
           if (dest) { isLink = true; endPos = dest.end; }
-        } else if (src[le] === '[') {
-          const re2 = findLabelEnd(src, le);
+        } else if (scan[le] === '[') {
+          const re2 = findLabelEnd(scan, le);
           if (re2 > 0) {
-            const ref = normLabel(src.slice(le + 1, re2 - 1) === '' ? labelText : src.slice(le + 1, re2 - 1));
+            const ref = normLabel(scan.slice(le + 1, re2 - 1) === '' ? labelText : scan.slice(le + 1, re2 - 1));
             if (links && links[ref]) { isLink = true; endPos = re2; }
           }
         } else {
@@ -1279,8 +1388,8 @@ function tryEmStrong(src, i, links) {
     if (tc !== r) continue;
     const q = tp + tok.length;
     const len = tok.length;
-    const bprev = tp === 0 ? '' : src[tp - 1];
-    const bnext = q < n ? src[q] : '';
+    const bprev = tp === 0 ? '' : scan[tp - 1];
+    const bnext = q < n ? scan[q] : '';
     const bprevWs = bprev === '' || isWsCh(bprev);
     const bnextWs = bnext === '' || isWsCh(bnext);
     const bprevPunct = bprev === '' ? false : isPunctCh(bprev);
@@ -1309,7 +1418,10 @@ function tryEmStrong(src, i, links) {
   return { kind: use === 1 ? 'em' : 'strong', text: src.slice(i + use, closerEnd - use), rawLen: closerEnd - i };
 }
 
-function tryDel(src, i, n) {
+// `scan` is the masked source for the closer search (same length as `src`);
+// the opener checks and the returned content use the raw `src`.
+function tryDel(src, i, n, scan) {
+  scan = scan || src;
   let j = i;
   while (j < n && src[j] === '~') j++;
   const o = j - i;
@@ -1325,17 +1437,17 @@ function tryDel(src, i, n) {
   }
   let p = o, k = j;
   while (k < n) {
-    const c = src[k];
+    const c = scan[k];
     if (c === '\\') { k += 2; continue; }
     if (c === '`') {
       let e = k;
-      while (e < n && src[e] === '`') e++;
+      while (e < n && scan[e] === '`') e++;
       const run = e - k;
       let m2 = e, found = -1;
       while (m2 < n) {
-        if (src[m2] === '`') {
+        if (scan[m2] === '`') {
           let f = m2;
-          while (f < n && src[f] === '`') f++;
+          while (f < n && scan[f] === '`') f++;
           if (f - m2 === run) { found = m2; break; }
           m2 = f;
         } else m2++;
@@ -1345,11 +1457,11 @@ function tryDel(src, i, n) {
     }
     if (c !== '~') { k++; continue; }
     let e = k;
-    while (e < n && src[e] === '~') e++;
+    while (e < n && scan[e] === '~') e++;
     const len = e - k;
     if (len < 1 || len > 2 || len !== o) { k = e; continue; }
-    const pprev = k === 0 ? '\n' : src[k - 1];
-    const nnext = e >= n ? '\n' : src[e];
+    const pprev = k === 0 ? '\n' : scan[k - 1];
+    const nnext = e >= n ? '\n' : scan[e];
     const pWs = isWsCh(pprev), nWs = isWsCh(nnext);
     const pPunct = isPunctCh(pprev), nPunct = isPunctCh(nnext);
     const leftFlank = !nWs && (!nPunct || pWs || pPunct);
@@ -1369,6 +1481,10 @@ function parseInline(src, links, linkState) {
   const nodes = [];
   const state = { inLink: !!(linkState && linkState.inLink), inRaw: false };
   const n = src.length;
+  // masked copy of this inline source for the emphasis/del closer searches
+  // (null when the text holds no delimiter at all; the search then scans
+  // the raw text, which is identical)
+  const masked = (src.indexOf('*') >= 0 || src.indexOf('_') >= 0 || src.indexOf('~') >= 0) ? buildMask(src) : null;
   let i = 0;
   let textStart = -1;
   const flushText = (end) => {
@@ -1415,12 +1531,19 @@ function parseInline(src, links, linkState) {
         const m = TAG_OPEN_RE.exec(tag);
         if (m) {
           const name = (m[1] || m[4]).toLowerCase();
-          const closing = tag[1] === '/';
+          // marked flips these flags only on narrow tag shapes, not on
+          // every tag with the name: inLink only on `<a ` (with attributes)
+          // and on `</a>` exactly, so a bare `<a>`, `<a/>`, or `</a >`
+          // leaves it alone; raw blocks likewise need a space or `>` after
+          // the name. An unguarded flip leaks inLink into later paragraphs
+          // and suppresses GFM autolinks there.
           if (RAW_TAGS[name]) {
-            if (closing) state.inRaw = false; else state.inRaw = true;
+            if (!state.inRaw && START_RAW_RE.test(tag)) state.inRaw = true;
+            else if (state.inRaw && END_RAW_RE.test(tag)) state.inRaw = false;
           }
           if (name === 'a') {
-            if (closing) state.inLink = false; else state.inLink = true;
+            if (!state.inLink && START_A_RE.test(tag)) state.inLink = true;
+            else if (state.inLink && END_A_RE.test(tag)) state.inLink = false;
           }
         }
         nodes.push({ t: 3, s: tag });
@@ -1526,9 +1649,14 @@ function parseInline(src, links, linkState) {
       continue;
     }
     if (c === '~') {
-      const d = tryDel(src, i, n);
+      const d = tryDel(src, i, n, masked);
       if (d) {
         flushText(i);
+        // Publish our current inLink before recursing: the child reads the
+        // shared object, so a </a> we already consumed (e.g. an unclosed
+        // <a href> closed earlier in this paragraph) must be visible to it,
+        // or the child's write-back would resurrect the stale value.
+        if (linkState) linkState.inLink = state.inLink;
         nodes.push({ t: 8, children: parseInline(d.content, links, linkState) });
         // the recursive call may have changed the shared inLink (e.g. a
         // </a> inside the del content); sync our snapshot or the final
@@ -1545,9 +1673,14 @@ function parseInline(src, links, linkState) {
       continue;
     }
     if (c === '*' || c === '_') {
-      const em = tryEmStrong(src, i, links);
+      const em = tryEmStrong(src, i, links, masked);
       if (em) {
         flushText(i);
+        // Publish our current inLink before recursing (see the del branch):
+        // without this, a </a> consumed earlier in this paragraph is
+        // invisible to the child, and the post-call sync would restore the
+        // stale true value, suppressing later GFM autolinks.
+        if (linkState) linkState.inLink = state.inLink;
         nodes.push({ t: em.kind === 'em' ? 6 : 7, children: parseInline(em.text, links, linkState) });
         // the recursive call may have changed the shared inLink (e.g. a
         // </a> inside the emphasis content); sync our snapshot or the
