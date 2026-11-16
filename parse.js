@@ -1530,6 +1530,10 @@ function parseInline(src, links, linkState) {
       if (d) {
         flushText(i);
         nodes.push({ t: 8, children: parseInline(d.content, links, linkState) });
+        // the recursive call may have changed the shared inLink (e.g. a
+        // </a> inside the del content); sync our snapshot or the final
+        // write-back would overwrite it with the stale value
+        if (linkState) state.inLink = linkState.inLink;
         i += d.rawLen;
         continue;
       }
@@ -1545,6 +1549,10 @@ function parseInline(src, links, linkState) {
       if (em) {
         flushText(i);
         nodes.push({ t: em.kind === 'em' ? 6 : 7, children: parseInline(em.text, links, linkState) });
+        // the recursive call may have changed the shared inLink (e.g. a
+        // </a> inside the emphasis content); sync our snapshot or the
+        // final write-back would overwrite it with the stale value
+        if (linkState) state.inLink = linkState.inLink;
         i += em.rawLen;
         continue;
       }
